@@ -92,13 +92,11 @@ async function handle(req) {
 
   const fwd = buildForwardHeaders(req);
 
-  // Keep to GET/HEAD unless you add body forwarding logic
-  const method = req.method === "HEAD" ? "HEAD" : "GET";
 
   let upstreamResp;
   try {
     upstreamResp = await fetch(upstream.toString(), {
-      method,
+      method: req.method,
       headers: fwd,
       redirect: "follow",
     });
