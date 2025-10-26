@@ -1,145 +1,144 @@
-export const runtime = "nodejs";
+// app/api/proxy/[...path]/route.js
 
-const UPSTREAM_HOST = "ev.turnitin.com";
-const INJECTED_COOKIE = process.env.TURNITIN_COOKIE || "";
+export const runtime = "nodejs"; // Use Node, not Edge
+export const dynamic = "force-dynamic"; // Always fresh
 
-// --- helpers ---
-function mergeCookies(cookieStrings, maxLen = 4096) {
-  const map = new Map();
-  for (const str of cookieStrings) {
-    for (const part of str.split(";")) {
-      const kv = part.trim();
-      if (!kv) continue;
-      const eq = kv.indexOf("=");
-      if (eq === -1) continue;
-      const name = kv.slice(0, eq).trim();
-      const value = kv.slice(eq + 1).trim();
-      if (!name) continue;
-      if (/^(_ga|_gid|_gcl_au|__utm|_hj|apt\.)/i.test(name)) continue; // skip analytics noise
-      map.set(name, value);
-    }
-  }
-  const merged = [...map.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
-  return merged.length > maxLen ? merged.slice(0, maxLen) : merged;
-}
+const UPSTREAM = "https://chatgpt.com";
+const INJECT_COOKIES = process.env.CHATGPT_COOKIES || "";
 
-function sanitizeResponseHeaders(h) {
-  const out = new Headers(h);
-  for (const k of [
-    "content-security-policy-report-only",
-    "report-to",
-    "nel",
-    "server",
-    "alt-svc",
-    "transfer-encoding",
-    "content-encoding", // let Node re-encode
-  ]) out.delete(k);
+// Hop-by-hop headers (never forward)
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+function copyRequestHeaders(req, override = {}) {
+  const out = new Headers();
+  req.headers.forEach((value, key) => {
+    const k = key.toLowerCase();
+    if (HOP_BY_HOP.has(k)) return;
+    if (k === "host") return;
+    if (k === "content-length") return;
+    out.set(k, value);
+  });
+  for (const [k, v] of Object.entries(override)) out.set(k.toLowerCase(), v);
+
+  // Never forward browser cookies upstream; inject only our own (if any)
+  if (INJECT_COOKIES) out.set("cookie", INJECT_COOKIES);
+  else out.delete("cookie");
+
   return out;
 }
 
-function buildForwardHeaders(req) {
-  const fwd = new Headers();
+function copyResponseHeaders(src, extra = {}) {
+  const out = new Headers();
+  src.headers.forEach((value, key) => {
+    const k = key.toLowerCase();
+    if (HOP_BY_HOP.has(k)) return;
+    if (k === "content-length") return; // avoid mismatches when streaming
+    out.set(k, value);
+  });
+  for (const [k, v] of Object.entries(extra)) out.set(k.toLowerCase(), v);
 
-  for (const h of [
-    "accept",
-    "accept-language",
-    "cache-control",
-    "pragma",
-    "upgrade-insecure-requests",
-  ]) {
-    const v = req.headers.get(h);
-    if (v) fwd.set(h, v);
-  }
-
-  fwd.set("user-agent", req.headers.get("user-agent") || "Mozilla/5.0");
-  fwd.set("referer", `https://${UPSTREAM_HOST}/`);
-  fwd.set("origin", `https://${UPSTREAM_HOST}`);
-
-  const incomingCookie = req.headers.get("cookie") || "";
-  const merged = mergeCookies([incomingCookie, INJECTED_COOKIE].filter(Boolean));
-  if (merged) fwd.set("cookie", merged);
-
-  return fwd;
+  // Never leak upstream Set-Cookie to your domain
+  out.delete("set-cookie");
+  return out;
 }
 
-function copySetCookie(src, dst) {
-  // undici's getSetCookie()
-  const anyHeaders = src;
-  if (typeof anyHeaders.getSetCookie === "function") {
-    for (const sc of anyHeaders.getSetCookie()) dst.append("set-cookie", sc);
-    return;
-  }
-  // fallback via raw()
-  const raw = anyHeaders.raw?.();
-  const setCookies = raw?.["set-cookie"];
-  if (Array.isArray(setCookies)) {
-    for (const sc of setCookies) dst.append("set-cookie", sc);
-  } else {
-    const sc = src.get("set-cookie");
-    if (sc) dst.set("set-cookie", sc);
-  }
-}
-
-async function handle(req) {
-  const inUrl = new URL(req.url);
-
-  const upstream = new URL(req.url);
-  upstream.protocol = "https:";
-  upstream.username = "";
-  upstream.password = "";
-  upstream.port = "";
-  upstream.host = UPSTREAM_HOST;
-
-  const fwd = buildForwardHeaders(req);
-
-
-  let upstreamResp;
-  try {
-    upstreamResp = await fetch(upstream.toString(), {
-      method: req.method,
-      headers: fwd,
-      redirect: "follow",
-    });
-  } catch (err) {
-    return new Response(
-      `Upstream fetch failed: ${err?.message || String(err)}`,
-      { status: 502, headers: { "content-type": "text/plain; charset=utf-8" } }
-    );
-  }
-
-  // Single retry with trailing slash if 404 and path lacks slash
-  if (upstreamResp.status === 404 && !upstream.pathname.endsWith("/")) {
-    try {
-      const retry = new URL(upstream);
-      retry.pathname = retry.pathname + "/";
-      upstreamResp = await fetch(retry.toString(), {
-        method,
-        headers: fwd,
-        redirect: "follow",
-      });
-    } catch {
-      // keep original 404
+// Follow 30x manually to handle tunnel/CDN/CF redirects
+async function fetchFollow(url, init, maxHops = 5) {
+  let current = url;
+  for (let i = 0; i < maxHops; i++) {
+    const res = await fetch(current, { ...init, redirect: "manual" });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location");
+      if (!loc) return res;
+      current = new URL(loc, current).toString();
+      continue;
     }
+    return res;
   }
+  return new Response("Too many redirects from upstream", { status: 508 });
+}
 
-  const out = sanitizeResponseHeaders(upstreamResp.headers);
-  out.set("x-proxied-by", "next-node-runtime-proxy");
-  out.set("access-control-allow-origin", inUrl.origin);
-  out.set("vary", "origin");
+function buildUpstreamUrl(req) {
+  const { pathname, search } = new URL(req.url);
+  // Strip the local prefix /api/proxy/ and forward the rest to UPSTREAM
+  const after = pathname.replace(/^\/api\/proxy\/?/, "");
+  const upstream = new URL(after || "/", UPSTREAM);
+  upstream.search = search;
+  return upstream.toString();
+}
 
-  copySetCookie(upstreamResp.headers, out);
+function corsHeaders(origin) {
+  const o = origin ?? "*";
+  return {
+    "access-control-allow-origin": o,
+    "access-control-allow-credentials": "true",
+    "access-control-allow-headers": "*,authorization,content-type",
+    "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "access-control-max-age": "600",
+    vary: "Origin",
+  };
+}
 
-  return new Response(upstreamResp.body, {
-    status: upstreamResp.status,
-    statusText: upstreamResp.statusText,
-    headers: out,
+// OPTIONS preflight — always 204
+export async function OPTIONS(req) {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders(req.headers.get("origin")),
   });
 }
 
-export async function GET(req) {
-  return handle(req);
+async function handle(req) {
+  const upstreamUrl = buildUpstreamUrl(req);
+
+  // Some sites check Origin/Referer
+  const spoof = {
+    origin: new URL(UPSTREAM).origin,
+    referer: new URL(UPSTREAM).origin + "/",
+  };
+
+  const headers = copyRequestHeaders(req, spoof);
+
+  const hasBody = !["GET", "HEAD"].includes(req.method);
+  const init = {
+    method: req.method,
+    headers,
+    body: hasBody ? req.body : undefined, // pass-through ReadableStream
+    cache: "no-store",
+    redirect: "manual",
+  };
+
+  const upstreamRes = await fetchFollow(upstreamUrl, init);
+
+  const resHeaders = copyResponseHeaders(upstreamRes, {
+    ...corsHeaders(req.headers.get("origin")),
+    "cache-control": upstreamRes.headers.get("cache-control") || "no-store",
+    "x-proxy-target": new URL(UPSTREAM).host,
+  });
+
+  // If SSE, ensure no-cache to keep stream happy
+  const ctype = upstreamRes.headers.get("content-type") || "";
+  if (ctype.includes("text/event-stream")) {
+    resHeaders.set("cache-control", "no-cache");
+  }
+
+  return new Response(upstreamRes.body, {
+    status: upstreamRes.status,
+    headers: resHeaders,
+  });
 }
 
-export async function HEAD(req) {
-  return handle(req);
-}
+export const GET = handle;
+export const HEAD = handle;
+export const POST = handle;
+export const PUT = handle;
+export const PATCH = handle;
+export const DELETE = handle;
